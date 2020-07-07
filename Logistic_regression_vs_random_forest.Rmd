@@ -1,0 +1,820 @@
+---
+title: Comparison of models for credit risk purposes - logistic regression vs random
+  forest
+author: "Katarzyna Kryńska"
+date: "5 07 2020"
+output: 
+  rmdformats::material:
+    highlight: tango
+    cards: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+library(rmdformats)
+library(corrplot)
+library(RColorBrewer)
+library(kableExtra)
+library(tidyverse)
+```
+
+
+```{r do_not_run, eval=F, include=F}
+# load data from OpenML and save to to a local directory
+library(OpenML)
+credit_OpenML <- getOMLDataSet(data.id = 31)
+df <- credit_OpenML$data
+save(df, file="df.rda")
+```
+
+
+# Abstract
+
+
+# Dataset description
+
+```{r load_df, eval=F, include=F}
+load("load/df.rda")
+
+# all variables are either factor or numeric, so that's good
+# BUT class has levels 1-2 and not 0-1, which might be a problem?
+# safer to change it into 0-1 values, where 0 is good and 1 is bad
+df$class <- as.numeric(df$class)-1
+```
+
+```{r summary_df, eval=F, include=F}
+# PRE-ANALYSIS OF DATA - SUMMARY, DESCRIPTION
+
+## summary
+#summary(df)
+
+## Desc
+#library(DescTools)
+#Desc(df)
+
+## are there any NAs? ----> NO
+colSums(is.na(df))
+
+## str
+str(df)
+
+# df$class <- factor(as.numeric(df$class) - 1, levels = c(0,1), labels = c("good", "bad"))
+
+```
+
+```{r merge_factor_variables, include=F, eval=F}
+
+## Merge some factor variables
+
+# credit_history
+# merge "all paid" with "no credits/all paid"
+new_labels <- levels(df$credit_history)[!levels(df$credit_history) %in% c("all paid")]
+new_levels <- c(1, 3, 4, 5)
+df$credit_history <- factor(ifelse(as.numeric(df$credit_history) %in% c(1,2), 1, df$credit_history), labels=new_labels)
+
+# purpose
+# 6 "repairs" dorzucam do 11 "other"
+# 5 "domestic appliance" do 3 "furniture/equipment"
+# 9 "retraining" do 7 "education"
+
+new_levels <- c(1:11)[!c(1:11) %in% c(6, 5, 9)]
+new_labels <- levels(df$purpose)[new_levels]
+new_labels[5] <- "education/retraining"
+
+df$purpose <- as.numeric(df$purpose)
+df$purpose <- ifelse(df$purpose %in% c(6,11), 11, df$purpose)
+df$purpose <- ifelse(df$purpose %in% c(5,3), 3, df$purpose)
+df$purpose <- ifelse(df$purpose %in% c(9,7), 7, df$purpose)
+df$purpose <- factor(df$purpose, levels=new_levels, labels=new_labels)
+
+# existing_credits
+df$existing_credits <- ifelse(df$existing_credits %in% c(3,4), 3, df$existing_credits)
+new_levels <- c(1:3)
+new_labels <- c("1", "2", ">2")
+df$existing_credits <- factor(df$existing_credits, levels=new_levels, labels=new_labels)
+
+```
+
+```{r DISCRETIZATION, eval=F, include=F}
+# DISCRETIZATION - FINE CLASSING
+
+## division variables into FACTORS and NUMERIC variables
+base <- df[, colnames(df) != "class"]
+base.n<-base[,sapply(base, is.numeric)]
+base.f<-base[,sapply(base, is.factor)]
+
+## percentiles
+percentile<-apply(X=base.n, MARGIN=2, FUN=function(x) round(quantile(x, seq(0.1,1,0.1), na.rm=TRUE),2))
+
+## unique values per column
+unique<-apply(base.n, MARGIN=2, function(x) length(unique(x)))
+
+## selecting only columns with more than 10 unique levels
+## binarization for numeric variables with >10 unique values
+numeric<-colnames(base.n[which(unique>=10)])
+for (m in numeric){
+  base.n[,paste(m,"_fine", sep="")]<-cut(
+    x=as.matrix(base.n[m]), 
+    breaks=c(-Inf,unique(percentile[,m])), 
+    labels =c(paste("<=",unique(percentile[,m])))
+    ) 
+}
+
+## columns with <10 levels will be transformed to factors
+num_as_fact<-colnames(base.n[which(unique<10 & unique>1 )])
+base.f[,num_as_fact]<-lapply(base.n[,num_as_fact],as.factor)
+base.n <- base.n[,!names(base.n) %in% num_as_fact]
+```
+
+```{r WOE_calc, eval=F, include=F}
+# Calculation of Weight of Evidence (WoE) using smbinning
+
+## in smbinning 0 means bad, --> reverting definition of gb flag
+base.n$class_woe<-(1-df$class)
+base.n$class <- df$class
+
+base.f$class_woe <- base.n$class_woe
+base.f$class <- base.n$class
+
+## Choice of vars to be analysed
+names.n<-colnames(base.n[,!names(base.n) %in% c(
+  colnames(base.n[ ,grepl(pattern="_fine" , x=names(base.n))]),
+  "class",
+  "class_woe")])
+names.f<-colnames(base.f[,!names(base.f) %in% c("class","class_woe")])
+
+## List for WOE - preallocation
+WOE <- list()
+
+## Dataframe for Information Value
+IV <- data.frame(VAR=character(), IV=integer())
+```
+
+```{r WoE_numeric.pdf, eval=F, include=F}
+# ANALYSIS OF NUMERIC VARIABLES
+library(smbinning)
+
+# Storing charts in a pdf file
+pdf(file="WoE_numeric.pdf",paper="a4")
+
+
+#Set up progress bar
+pb<- txtProgressBar(min = 0, max = length(names.n), style = 3)
+
+for (i in names.n){
+  
+  # rows and columns at a chart
+  par(mfrow=c(2,2))
+  
+  # smbinning.custom(df, y, x, cuts)
+  # df - data frame
+  # y - GB flag
+  # x - risk factors
+  # cuts - cut-offs
+  results<- smbinning.custom(df=base.n, y="class_woe", x=i, cuts=unique(percentile[,i]))
+  
+  # BOXPLOT
+  boxplot(base.n[,i]~base.n$class, horizontal=T, frame=F, col="lightgray",main="Distribution") 
+  mtext(i,3) 
+  # Frequency plot 
+  smbinning.plot(results,option="dist",sub=i)
+  # Bad rate fractions
+  smbinning.plot(results,option="badrate",sub=i) 
+  # WoE
+  smbinning.plot(results,option="WoE",sub=i)
+
+  # IV row binding
+  IV<-rbind(IV, as.data.frame(cbind("VAR"=i, "IV"=results$ivtable[results$ivtable$Cutpoint=="Total", "IV"])))
+  
+  # Saving data 
+  d<-results$ivtable[,c("Cutpoint","WoE","PctRec")]
+  # Total row removal  
+  d<-d[d$Cutpoint!="Total",]
+  # Ordering wrt WoE - for gini etc. calculation
+  d<-d[with(d, order(d$WoE)),]
+  # Id 
+  d$numer<-11:(nrow(d)+10)
+  # Saving WoE in list 
+  WOE[[i]]<-d
+  
+  #Update progess bar  
+  setTxtProgressBar(pb,  min(grep(i, names.n)))
+} 
+
+close(pb)
+dev.off()
+
+# Reseting charts options
+resetPar <- function() {
+  dev.new()
+  op <- par(no.readonly = TRUE)
+  dev.off()
+  op
+}
+
+resetPar()
+
+# Insights:
+# 1) duration - almost linear relationship between credit duration and probability of default
+# 2) credit_amount - looks like a non-linear relationship, mid credit_amounts have the smallest pod,
+# while the smallest and especially biggest credits are more prone to default
+# 3) age - relationship not clear, the risk seems to be dropping with bigger age, but people (52;75] seem
+# riskier than people (36;52]
+```
+
+```{r WoE_factor.pdf, include=F, eval=F}
+str(base.f)
+
+# PDF
+pdf(file="WoE_factor.pdf",paper="a4")
+
+# progress bar
+pb<- txtProgressBar(min = 0, max = length(names.f), style = 3)
+
+for (i in names.f){
+
+  #neede to join results for factors and numerics
+  base.f[,paste(i,"_fine", sep="")]<-base.f[,i]
+    
+  par(mfrow=c(2,2))
+  
+  results <- smbinning.factor(df=base.f, y="class_woe", x=i, maxcat=length(unique(base.f[,i])))
+  # df - data frame
+  # y - GB
+  # x - variable 
+  # maxcat - maximal accepted number of categories
+
+  smbinning.plot(results,option="dist",sub=i) 
+  smbinning.plot(results,option="badrate",sub=i) 
+  smbinning.plot(results,option="WoE",sub=i)
+  
+  IV<-rbind(IV, as.data.frame(cbind("VAR"=i, "IV"=results$ivtable[results$ivtable$Cutpoint=="Total", "IV"])))
+
+  d<-results$ivtable[,c("Cutpoint","WoE","PctRec")]
+ 
+  d<-d[d$Cutpoint!="Total",]
+ 
+  d<-d[with(d, order(d$WoE)),]
+  
+  d$numer<-11:(nrow(d)+10)
+  
+  WOE[[i]]<-d
+  
+  setTxtProgressBar(pb,  min(grep(i, names.f)))
+} 
+close(pb)
+dev.off()
+
+```
+
+```{r variables_quality_gini_iv, eval=F, include=F}
+base <- cbind(base.f[,!names(base.f) %in% c("class_woe", "class")], base.n)
+library(forcats)
+library(pROC)
+
+# progress bar
+pb<- txtProgressBar(min = 0, max = length(names(WOE)), style = 3)
+stats<-cbind(IV, Gini=NA, miss=NA)
+l<-"checking_status"
+
+for (l in names(WOE)){
+
+  # objects need for Gini calculation
+  variable<-base[,c("class_woe", paste(l,"_fine", sep=""))]
+  woe<- WOE[[l]][c("Cutpoint", "WoE")]
+  
+  # Cutpoint values change if Factor
+  if (is.character(woe$Cutpoint)==TRUE) { 
+    woe$Cutpoint<-as.factor(gsub("= '|'", "", woe$Cutpoint))
+    woe$Cutpoint<-as.factor(woe$Cutpoint)
+  }
+  
+  # Var levels and WoE merging
+    # merge()
+    # x,y - tables
+    # by.x .y key
+    # all.x=T - left join
+  
+  dat_temp<-merge(variable, woe, by.x=paste(l,"_fine", sep=""), by.y="Cutpoint", all.x=T)
+
+ # name change
+  colnames(dat_temp)[which(names(dat_temp) == "WoE")] <- paste(l, "_woe", sep="")  
+  
+  # adding WoE var to original dataset
+  base<-merge(base, woe, by.x=paste(l,"_fine", sep=""), by.y="Cutpoint", all.x=T)
+  colnames(base)[which(names(base) == "WoE")] <- paste(l, "_woe", sep="")
+  
+  # gini claculation
+  #   gini = 2*AUROC-1
+  #   auc() function for AUROC calculation
+  #   ?pROC
+  
+  gini<- c(2*auc(dat_temp$class_woe,dat_temp[,paste(l, "_woe", sep="") ])-1)
+  
+  stats[stats$VAR==l, "Gini"]<-gini
+  
+  miss<-1-c(nrow(dat_temp[dat_temp[,paste(l,"_fine", sep="")]!='Missing', ])/nrow(dat_temp))
+  
+  stats[stats$VAR==l, "miss"]<-miss
+  
+  setTxtProgressBar(pb,  min(grep(l, names(WOE))))
+  
+}
+
+close(pb)
+
+write.csv(stats, "stats.csv")
+
+```
+
+```{r variables_quality_kendall_correlation, include=F, eval=F}
+
+# only _woe variables
+var_to_check<-colnames(base)[grep("_woe", colnames(base))]
+# exclusion of class_woe
+var_to_check<-var_to_check[-1]
+base_kor<-base[,var_to_check]
+
+# cor()
+# x- base
+# method - type of corr coeff
+# use - what to do if missings?; "pairwise" - deleting observations only if missing in considered vars,
+kendall <-cor(base_kor, method = "kendall",use="pairwise")
+save(kendall, file="load/kendall.Rdata")
+```
+
+```{r variables_selection, include=F, eval=F}
+
+corr_list<-data.frame()
+
+# ordering correlation matrix wrt Gini (rows & columns)
+#woe var creation
+stats$VARW<-paste(stats$VAR,"_woe",sep="")
+# merging statistics & correlation results
+stat<-merge(x = stats, y = kendall, by.x = "VARW",by.y="row.names",all.y=T)
+#ordering wrt Gini - descending
+stat<-stat[ order(-stat[,"Gini"]), ]
+#changing row names as variables names
+row.names(stat)<-stat[,1]
+#only correlation matrix
+stat<-stat[6:length(stat[1,])]
+#vector of names
+cols<-row.names(stat[,])
+#coloum ordering wrt Gini
+stat<-stat[cols]
+
+#if no correlation (missings) then small value of correlation assigning, 
+#that won't delete var from the analysis
+temp_k<-stat
+temp_k<-replace(temp_k, is.na(temp_k), 0.000001000)
+# 
+# loop reapet()
+# it works till stop
+
+# install.packages("plyr")
+library(plyr)
+threshold<-0.5
+
+repeat{
+  #even though this condistion is at the beggining, it has rather final character 
+  # condition to stop a loop is reduction to NULL object
+  # it may happend when in the last loop all variables satisfy a condition
+  # > threshold 
+  if (length(temp_k)<1) {
+    break
+  }
+  
+  # selection of all variables that correlation with a first variable is higher than threshold
+  # NOTE: correlation coefficient between variable and  itself is equal 1 so it wuold be taken into data frame
+  row_k<-abs(temp_k[1,]) > threshold
+  row_k[1]<-TRUE
+  
+  # condition checkig wheter we are at the end of the analysis
+  # if not then vars that > threshold is satisfied are taken
+  # in yes the final variable is taken
+  if(length(row_k)>1){
+    row_k2<-row_k[,row_k]
+  }else{row_k2<-row_k}
+  
+  # from temp_k all rows kept in row_k2 are deleted
+  
+  temp_k<-as.data.frame(temp_k[!t(row_k),!row_k])
+  
+  #if only one variable remains then R would reduce DF to vector and names for rows and columns have to be defined
+  if(length(temp_k)==1){ 
+    colnames(temp_k)<- dimnames(row_k)[[2]][-which(row_k)]
+    rownames(temp_k)<- dimnames(row_k)[[2]][-which(row_k)]
+  }
+  
+  
+  #creation of vecotr with variables that satisfy > threshold
+  if(length(row_k2)==1) {
+    variable<-row.names(row_k)
+    namess<-as.data.frame(variable)
+  }
+  
+  if(length(row_k2)>1) {
+    row_k2<-row_k2[2:length(row_k2)]
+    row_k2<-as.data.frame(t(row_k2))
+    namess<-colnames(row_k2)
+    namess<-as.data.frame(t(namess))
+    row.names(namess) <- row.names(row_k)
+    variable<-row.names(row_k)
+    variable<-as.data.frame(variable)
+    namess<-merge(variable,namess)
+  }
+  
+  
+  # adding to corr_list row with all correlated vars with the variable
+  # rbind.fill() - filling missing columns with NA
+  
+  corr_list<-rbind.fill(corr_list,namess)
+  
+  # condition to leave a loop - when last variable left
+  
+  if(length(temp_k)==1){ 
+    variable<-dimnames(row_k)[[2]][-which(row_k)]
+    namess<-as.data.frame(variable)
+    corr_list<-rbind.fill(corr_list,namess)
+    break}
+  
+}
+
+# merging of data with stats and correlations
+all<-merge(x = stats, y = corr_list, by.x = "VARW",by.y="variable",all.y=T)
+# ordering by Gini
+all<-all[ order(-all[,"Gini"]), ]
+# exclusion of variables with gini below 0.1
+all<-all[all$Gini>0.1,]
+
+base_coarse<-base[-grep("_fine",colnames(base))]
+kols<-c(as.character(all$VAR),"class","class_woe")
+base_coarse<-base_coarse[,kols]
+
+```
+
+```{r sample_split, include=F, eval=F}
+
+#drawing with stratification  
+library(caTools)
+
+# two subsamples, one for each subsample
+# list with number of strata dimensions
+# f - strata
+d_split<-split(x=base_coarse, f=base_coarse$class)
+
+# table train i test
+train = list()
+test=list()
+
+
+# for loop for each strata
+
+for (i in 1:length(d_split)){
+  
+  set.seed(1916)
+
+  # splitting vector for i-th strata
+  assign(
+    paste("sample",i,sep="_"),sample.split(d_split[[i]][,1], SplitRatio = .7))
+  
+  # training set for i-th starta
+  assign(
+    paste("train",i,sep="_"),subset(d_split[[i]],  get(paste("sample",i,sep="_")) == TRUE))
+  
+  # validation set for i-th starta
+  assign(
+    paste("test",i,sep="_"),subset(d_split[[i]], get(paste("sample",i,sep="_")) == FALSE))
+  
+  train[[i]]<-get(paste("train",i,sep="_"))
+  test[[i]]<-get(paste("test",i,sep="_"))
+}
+
+# row binding of lists train & test
+train = do.call(rbind, train)
+test = do.call(rbind, test)
+
+# removing unnecessery objects
+rm( test_1, test_2
+    , train_1, train_2
+    , sample_1, sample_2)
+
+mean(train$class)
+mean(test$class)
+
+save(train,file="train.RData")
+save(test,file="test.RData")
+
+```
+
+```{r WoE_coarse_numeric.pdf, include=F, eval=F}
+load("load/test.RData")
+load("load/train.RData")
+
+columns <- colnames(train)[-which(names(train) %in% c("class","class_woe"))]
+columns.n<-columns[sapply(train[,columns], is.numeric)]
+
+source("ivmult.r")
+library(ggplot2)
+
+# progress bar
+waitBar <- txtProgressBar(min = 0, max = length(columns.n), style = 3)
+
+temp<-data.frame(VAR=character(), VALUE=integer())
+stats<-data.frame(VAR=character(), IV=integer(),Gini=integer(), MISS=integer(),IVw=integer(),Giniw=integer(), MISSw=integer())
+
+#cut offs for testing data
+cut_offs<-data.frame(VAR=character(), cuts=integer())
+
+current_var<-columns.n[2]
+
+pdf("WoE_coarse_numeric.pdf")
+
+for (current_var in columns.n){
+  
+  par(xpd = T, mar = par()$mar, mfrow=c(2,2))
+  
+  # smbinning using decision tree
+  # Optimal Binning categorizes a numeric characteristic into bins for ulterior usage in scoring modeling. 
+  # This process, also known as supervised discretization, utilizes Recursive Partitioning to categorize the numeric characteristic.
+  # The especific algorithm is Conditional Inference Trees which initially excludes missing values (NA) to compute the cutpoints, adding them back later in the process for the calculation of the Information Value.
+  
+  result<-smbinning(train[,c("class_woe", current_var)], 
+                    y="class_woe", 
+                    x=current_var, 
+                    p=0.05)
+  # for age
+  if(length(result)<=1){
+    # only for age
+    age_cut <- c(25, 33)
+    result<- smbinning.custom(df=train, y="class_woe", x=current_var, cuts=age_cut)
+  }
+  
+  
+  if(length(result)>1){
+    points<-list(result$cuts)
+    cut_offs<-rbind(cut_offs,as.data.frame(cbind("VAR"=current_var,"cuts"=points)))
+    
+    IV<-result$ivtable
+    
+    #coarsed variables  
+    train[,paste(current_var, "_coarse", sep="")]<- cut(train[,current_var], 
+                                                        breaks=c(-Inf,unique(result$cuts),Inf), 
+                                                        labels=c(paste("<=", unique(result$cuts)),"<= Inf"),
+                                                        include.lowest = T)
+    train[,paste(current_var, "_coarse", sep="")]<-fct_explicit_na(train[,paste(current_var, "_coarse", sep="")], na_level="Missing")
+    
+    test[,paste(current_var, "_coarse", sep="")]<- cut(test[,current_var],
+                                                       breaks=c(-Inf,unique(result$cuts),Inf), 
+                                                       labels=c(paste("<=", unique(result$cuts)),"<= Inf"),
+                                                       include.lowest = T)
+    test[,paste(current_var, "_coarse", sep="")]<-fct_explicit_na(test[,paste(current_var, "_coarse", sep="")], na_level="Missing")
+    
+    
+    IVw<-sum(iv.mult(test,"class",vars=paste(current_var,"_coarse",sep=""))[[1]][,"miv"])
+    IV$Cutpoint<-ifelse(grepl(">",IV$Cutpoint)==T,"<= Inf",IV$Cutpoint)
+    
+    #addig WoE variable
+    train<-merge(train,IV[,c("Cutpoint", "WoE")],by.x= paste(current_var, "_coarse", sep=""), by.y="Cutpoint", all.x=T, sort=F)
+    colnames(train)[which(names(train) == "WoE")] <- paste(current_var, "_woe", sep="") 
+    
+    test<-merge(test,IV[,c("Cutpoint", "WoE")],by.x= paste(current_var, "_coarse", sep=""), by.y="Cutpoint", all.x=T, sort=F)
+    colnames(test)[which(names(test) == "WoE")] <- paste(current_var, "_woe", sep="")
+    
+    #GINI
+    gini<- 2*auc(train$class_woe,train[,paste(current_var, "_woe", sep="") ])-1
+    giniw<- 2*auc(test$class_woe,test[,paste(current_var, "_woe", sep="") ])-1
+    # % missings
+    miss<-1-nrow(train[!(is.na(train[,current_var])),])/nrow(train)
+    missw<-1-nrow(test[!(is.na(test[,current_var])),])/nrow(test)
+    #stats<-rbind(stats, as.data.frame(cbind("VAR"=current_var, "IV"=IV[IV$Cutpoint=="Total", "IV"],"Gini"=gini,  "MISS"=miss,"IVw"=IVw, "Giniw"=giniw,  "MISSw"=missw)))
+    
+    plot<-IV[!is.na(IV$WoE) & IV$Cutpoint!="Total",]
+    plot$WoE<-ifelse(plot$WoE==Inf, 8, ifelse(plot$WoE==-Inf, -8,plot$WoE))
+    g<-barplot(plot$WoE,names.arg=plot$Cutpoint, cex.names=0.5, main=current_var, xaxt="n")
+    print(g)
+    axis(1,g,plot$Cutpoint, tick=F, las=2, cex.axis=0.7)
+    text(g,plot$WoE, labels=paste("WoE=",format(plot$WoE,digits=1)," \n Fill=",round(plot$PctRec,3)*100, "%", sep=""), xpd = T, col = "black", pos=3, cex=0.7)
+    
+    # stability
+    freq.test<-as.data.frame(table(test[,paste(current_var, "_coarse", sep="")])/ nrow(test))
+    colnames(freq.test)<-c("Cutpoint", "PctRec")
+    freq.train<-plot[,c("Cutpoint","PctRec")]
+    freq<-merge(freq.train,freq.test, all.x=T, by="Cutpoint")
+    colnames(freq)<- c("Cutpoint","Train","Test")
+    rownames(freq)<-freq[,1]
+    freq<-freq[,-1]
+    
+    stacked<-barplot(as.matrix(freq), beside=F, main=current_var)
+    print(stacked)
+    legend("topright", legend=row.names(freq), cex=0.6, bty="o",pch=21)
+    
+    smbinning.plot(result,option="dist",sub=current_var)
+    
+    smbinning.plot(result,option="badrate",sub=current_var) 
+    
+  } 
+  
+  setTxtProgressBar(waitBar,  min(grep(current_var, columns.n)))
+}
+dev.off()
+
+```
+
+```{r woeBinning, include=F, eval=F}
+library(woeBinning)
+columns.f <- columns[sapply(train[,columns], is.factor)]
+woe.bin_f <- woe.binning(train, 
+                         target.var="class", 
+                         pred.var=columns.f, 
+                         min.perc.total=0.05,
+                         min.perc.class=0.02, 
+                         stop.limit=0.1)
+# min.perc.total =	
+#   For numeric variables this parameter defines the number of initial classes before any merging is applied. For example min.perc.total=0.05 (5%) will result in 20 initial classes. 
+#   For factors the original levels with a percentage below this limit are collected in a ‘miscellaneous’ level before the merging based on the min.perc.class and on the WOE starts. 
+#   Accepted range: 0.01-0.2; default: 0.05.
+
+# min.perc.class =
+#   If a column percentage of one of the target classes within a bin is below this limit (e.g. below 0.01=1%) then the respective bin will be joined with others. In case of numeric variables adjacent predictor classes are merged. 
+#   For factors respective levels (including sparse NAs) are assigned to a ‘miscellaneous’ level. 
+#   Accepted range: 0-0.2; default: 0, i.e. no merging with respect to sparse target classes is applied.
+
+# stop.limit	
+# Stops WOE based merging of the predictor's classes/levels in case the resulting information value (IV) decreases more than x% (e.g. 0.05 = 5%) compared to the preceding binning step. stop.limit=0 will skip any WOE based merging. 
+# Increasing the stop.limit will simplify the binning solution and may avoid overfitting. 
+# Accepted range: 0-0.5; default: 0.1.
+
+woe.binning.plot(woe.bin_f, multiple.plots=F)
+woe.binning.table(woe.bin_f)
+train<-woe.binning.deploy(train, woe.bin_f,add.woe.or.dum.var='woe')
+test<-woe.binning.deploy(test, woe.bin_f,add.woe.or.dum.var='woe')
+
+
+# I should unify the names of binned/coarse variables and woe
+library(stringr)
+## woe.credit_history.binned --------> credit_history_woe
+pattern <- "woe.\\w+.binned"
+idx <- str_detect(colnames(train), regex(pattern))
+new_str <- str_extract(colnames(train),pattern) %>% str_remove("woe.") %>% str_remove(".binned") %>% str_c("_woe")
+colnames(train) <- ifelse(idx, new_str, colnames(train))
+colnames(test) <- ifelse(idx, new_str, colnames(train))
+## checking_status.binned ----------> "checking_status_coarse
+pattern <- "\\w+.binned"
+idx <- str_detect(colnames(train), regex(pattern))
+new_str <- str_extract(colnames(train),pattern) %>% str_remove(".binned") %>% str_c("_coarse")
+colnames(train) <- ifelse(idx, new_str, colnames(train))
+colnames(test) <- ifelse(idx, new_str, colnames(train))
+
+str(test)
+
+```
+
+```{r WOE_coarse_all.pdf, include=F, eval=F}
+
+columns.coarse <- str_extract(colnames(train),"\\w+_coarse")[str_detect(colnames(train), "\\w+_coarse")]
+
+# progress bar
+waitBar<- txtProgressBar(min = 0, max = length(columns.coarse), style = 3)
+
+resetPar <- function() {
+  dev.new()
+  op <- par(no.readonly = TRUE)
+  dev.off()
+  op
+}
+
+pdf("WOE_coarse_all.pdf")
+
+current_variable <- "credit_amount"
+current_variable<-columns.coarse[1]
+
+for (current_variable in columns.coarse){
+  
+  par(xpd = T, mfrow=c(2,2))
+  result<-smbinning.factor(train[,c("class_woe", current_variable)], y="class_woe", x=current_variable)
+
+  points<-list(result$cuts)
+  cut_offs<-rbind(cut_offs,as.data.frame(cbind("VAR"=current_variable,"cuts"=points)))
+  
+  IV<-result$ivtable
+  IVw<-sum(iv.mult(test,"class",vars=current_variable)[[1]][,"miv"])
+  IV$Cutpoint<-as.factor(gsub("= |'","",IV$Cutpoint))
+
+  #GINI
+  gini<- 2*auc(train$class_woe,train[,gsub("_coarse","_woe",current_variable) ])-1
+  giniw<- 2*auc(test$class_woe,test[,gsub("_coarse","_woe",current_variable)])-1
+  
+  miss<-1-nrow(train[!(is.na(train[,current_variable])),])/nrow(train)
+  missw<-1-nrow(test[!(is.na(test[,current_variable])),])/nrow(test)
+  stats<-rbind(stats, as.data.frame(cbind("VAR"=current_variable, "IV"=IV[IV$Cutpoint=="Total", "IV"],"Gini"=gini,  "MISS"=miss,"IVw"=IVw, "Giniw"=giniw,  "MISSw"=missw)))
+  
+  #plot WoE
+  plot<-IV[!is.na(IV$WoE) & IV$Cutpoint!="Total",]
+  plot$WoE<-ifelse(plot$WoE==Inf, 8, ifelse(plot$WoE==-Inf, -8,plot$WoE))
+  g<-barplot(plot$WoE,names.arg=plot$Cutpoint, cex.names=0.5, main=current_variable, xaxt="n")
+  print(g)
+  axis(1,g,plot$Cutpoint, tick=F, las=2, cex.axis=0.7)
+  text(g,plot$WoE, labels=paste("WoE=",format(plot$WoE,digits=1)," \n Fill=",round(plot$PctRec,3)*100, "%", sep=""), xpd = T, col = "black", pos=3, cex=0.7)
+  
+  # stability
+  
+  freq.test<-as.data.frame(table(test[,current_variable])/ nrow(test))
+  colnames(freq.test)<-c("Cutpoint", "PctRec")
+  freq.train<-plot[,c("Cutpoint","PctRec")]
+  freq<-merge(freq.train,freq.test, all.x=T, by="Cutpoint")
+  colnames(freq)<- c("Cutpoint","Train","Test")
+  rownames(freq)<-freq[,1]
+  freq<-freq[,-1]
+  
+  stacked<-barplot(as.matrix(freq), beside=F, main=current_variable)
+  print(stacked)
+  
+  smbinning.plot(result,option="dist",sub=current_variable)
+  
+  smbinning.plot(result,option="badrate",sub=current_variable) 
+
+setTxtProgressBar(waitBar,  min(grep(current_variable, columns.f)))
+}
+
+dev.off()
+warnings()
+par(resetPar()) 
+
+#Saving -----------------------------------
+
+#write.csv(stats, file="stats_final.csv")
+save(train,file="load/train_final.Rdata")
+save(test,file="load/test_final.Rdata")
+```
+
+Dataset that was used in this research is a well-known *credit-g* dataset, available at OpenML [https://www.openml.org/d/31](https://www.openml.org/d/31). Original dataset contains 1 target value, *class*, which describes if the customer is good or bad, and 21 attributes:
+
+1. *checking_status* - Status of existing checking account, in Deutsche Mark.
+2. *duration* - Duration in months
+3. *credit_history* - Credit history (credits taken, paid back duly, delays, critical accounts)
+4. *purpose* - Purpose of the credit (car, television,...)
+5. *credit_amount* - Credit amount
+6. *savings_status* - Status of savings account/bonds, in Deutsche Mark.
+7. *employment* - Present employment, in number of years.
+8. *installment_commitment* - Installment rate in percentage of disposable income
+9. *personal_status* - Personal status (married, single,...) and sex
+10. *other_parties* - Other debtors / guarantors
+11. *residence_since* - Present residence since X years
+12. *property_magnitude* - Property (e.g. real estate)
+13. *age* - Age in years
+14. *other_payment_plans* - Other installment plans (banks, stores)
+15. *housing* - Housing (rent, own,...)
+16. *existing_credits* - Number of existing credits at this bank
+17. *job* - Job
+18. *num_dependents* - Number of people being liable to provide maintenance for
+19. *own_telephone* - Telephone (yes,no)
+20. *foreign_worker* - Foreign worker (yes,no)
+
+The datasets contains data for 1000 customers, of which 700 are good and 300 are bad ones. This means that the data is not much imbalanced and there is enough number of bad clients to estimate/train a reliable model.
+
+To build a scorecard model based on logistic regression, coarse classing of the data is needed. Firstly, continuous variables were binned into factor variables. The initial division into bins was made with respect to percentiles. In case of some variables which were originally factors, merging similar categories was done. 
+
+In the end, we ended up with 20 factor variables. Then, we checked their correlation, using Kendall correlation measure. This is important in order not to introduce colinearity into our model. The result is plotted below:
+
+```{r plot_kendall_corr, out.width = '80%', fig.align='center', fig.asp = .80}
+
+load("load/kendall.Rdata")
+corrplot(kendall, type="upper", 
+         order="hclust",
+         col=brewer.pal(n=8, name="BrBG"),
+         tl.cex=0.55,
+         tl.col="brown",
+         tl.offset=1,
+         tl.srt=45,)
+
+```
+
+It seems like there will not be any problems with colinearity in the model. We might only consider removing either *credit_history* or *existing_credits*, as their correlation is around 50%.
+
+Then, we calculated some variables quality statistics, like Gini and Information Value.
+
+```{r print_variables_quality_table}
+quality_table <- read.csv("stats.csv")
+quality_table <- quality_table %>% arrange(desc(Gini)) %>% subset(select=-c(X, miss))
+quality_table$"No." <- c(1:20)
+quality_table <- quality_table[c(4, 1, 2, 3)]
+kable(quality_table, digits = 4) %>% kable_styling(bootstrap_options = c("striped", "hover","condensed", "responsive"))
+```
+
+We decided to include in our final dataset only these variables, for which Gini value is bigger than 10%. In the end we ended up with 11 explanatory variables.
+
+To divide the dataset into *train* and *test* samples, we used stratified sampling. This way the ratio between number of good and bad clients is the same for *train* and *test* samples. 
+
+Then, using *train* sample, we performed supervised discretization. We used Optimal Binning to categorise numeric variables into bins for scoring modeling. Only for age bins were not assigned by the algorithm, so they were created manually, based on WoE of previously created percentiles. In case of factor variables, they were automatically merged into groups with the use of woeBinning package. 
+
+
+
+
+# Logistic regression
+
+
+# Random forest
+
+
+# Summary
