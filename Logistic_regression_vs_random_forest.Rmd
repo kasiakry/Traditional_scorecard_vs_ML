@@ -16,8 +16,34 @@ library(corrplot)
 library(RColorBrewer)
 library(kableExtra)
 library(tidyverse)
+library(stargazer)
+library(stats)
+library(pROC)
+library(caret)
 ```
 
+<style>
+
+table, td, th {
+  border: none;
+  padding-left: 1em;
+  padding-right: 1em;
+  margin-left: auto;
+  margin-right: auto;
+  margin-top: 1em;
+  margin-bottom: 1em;
+}
+
+</style>
+
+```{r libraries outside_mrkdown, include=F, eval=F}
+source("ivmult.r")
+library(ggplot2)
+library(smbinning)
+library(forcats)
+library(pROC)
+library(stringr)
+```
 
 ```{r do_not_run, eval=F, include=F}
 # load data from OpenML and save to to a local directory
@@ -30,6 +56,7 @@ save(df, file="df.rda")
 
 # Abstract
 
+The main of this research is to compare traditional logistic regression with random forest for the purpose of scorecard. This research will be based on empirical results only. Firstly, we will estimate a logistic regression model, in accordance with the best practices. Then we will train a Random Forest Classifier. Finally, we will compare the predictions of both approaches, using various performance measures.
 
 # Dataset description
 
@@ -152,7 +179,6 @@ IV <- data.frame(VAR=character(), IV=integer())
 
 ```{r WoE_numeric.pdf, eval=F, include=F}
 # ANALYSIS OF NUMERIC VARIABLES
-library(smbinning)
 
 # Storing charts in a pdf file
 pdf(file="WoE_numeric.pdf",paper="a4")
@@ -269,8 +295,6 @@ dev.off()
 
 ```{r variables_quality_gini_iv, eval=F, include=F}
 base <- cbind(base.f[,!names(base.f) %in% c("class_woe", "class")], base.n)
-library(forcats)
-library(pROC)
 
 # progress bar
 pb<- txtProgressBar(min = 0, max = length(names(WOE)), style = 3)
@@ -371,7 +395,6 @@ temp_k<-replace(temp_k, is.na(temp_k), 0.000001000)
 # loop reapet()
 # it works till stop
 
-# install.packages("plyr")
 library(plyr)
 threshold<-0.5
 
@@ -514,9 +537,6 @@ load("load/train.RData")
 columns <- colnames(train)[-which(names(train) %in% c("class","class_woe"))]
 columns.n<-columns[sapply(train[,columns], is.numeric)]
 
-source("ivmult.r")
-library(ggplot2)
-
 # progress bar
 waitBar <- txtProgressBar(min = 0, max = length(columns.n), style = 3)
 
@@ -652,7 +672,7 @@ test<-woe.binning.deploy(test, woe.bin_f,add.woe.or.dum.var='woe')
 
 
 # I should unify the names of binned/coarse variables and woe
-library(stringr)
+
 ## woe.credit_history.binned --------> credit_history_woe
 pattern <- "woe.\\w+.binned"
 idx <- str_detect(colnames(train), regex(pattern))
@@ -686,7 +706,6 @@ resetPar <- function() {
 
 pdf("WOE_coarse_all.pdf")
 
-current_variable <- "credit_amount"
 current_variable<-columns.coarse[1]
 
 for (current_variable in columns.coarse){
@@ -721,6 +740,7 @@ for (current_variable in columns.coarse){
   
   freq.test<-as.data.frame(table(test[,current_variable])/ nrow(test))
   colnames(freq.test)<-c("Cutpoint", "PctRec")
+  freq.test$Cutpoint <- str_replace(freq.test$Cutpoint,"<= ","<")
   freq.train<-plot[,c("Cutpoint","PctRec")]
   freq<-merge(freq.train,freq.test, all.x=T, by="Cutpoint")
   colnames(freq)<- c("Cutpoint","Train","Test")
@@ -744,6 +764,17 @@ par(resetPar())
 #Saving -----------------------------------
 
 #write.csv(stats, file="stats_final.csv")
+
+# change order of columns
+
+train <- train %>% select(sort(current_vars()))
+new_order <- c(colnames(train)[!colnames(train) %in% c("class", "class_woe")],
+               "class",
+               "class_woe")
+train <- train %>% select(new_order)
+test <- test %>% select(new_order)
+
+str(train)
 save(train,file="load/train_final.Rdata")
 save(test,file="load/test_final.Rdata")
 ```
@@ -808,13 +839,578 @@ To divide the dataset into *train* and *test* samples, we used stratified sampli
 
 Then, using *train* sample, we performed supervised discretization. We used Optimal Binning to categorise numeric variables into bins for scoring modeling. Only for age bins were not assigned by the algorithm, so they were created manually, based on WoE of previously created percentiles. In case of factor variables, they were automatically merged into groups with the use of woeBinning package. 
 
+Charts for all analysed variables:
 
+1. WoE for final bins,
 
+2. Stability analysis - percentage of customers in each bin across train and test samples,
+
+3. Distribution (percentage) of all customers in each bin,
+
+4. Bad rate for each bin,
+
+can be find in the pdf file on [Github](https://github.com/kasiakry/Traditional_scorecard_vs_ML/blob/master/WOE_coarse_all.pdf).
 
 # Logistic regression
 
+```{r base_model, include=F, eval=T}
+load("load/test_final.Rdata")
+load("load/train_final.Rdata")
 
-# Random forest
+source("quality_assessment.R")
 
+cols <- colnames(train)[grep("woe", colnames(train))]
+cols <-cols[-grep("class_woe", cols)]
+
+df <- train[,c("class",cols)]
+
+# model with constant only
+base_model <- glm(class ~ 1,data=df, family=binomial("logit"))
+summary(base_model)
+# save(base_model,file="load/glm_base_model.Rdata")
+
+# theoretical value  = ln(p/(1-p)) -> p=e^wd/(1+e^wd) -> e^-1.259/(1+e^-1.259) -> 22,11%
+# constant -> expected value for a base group -> whole sample
+exp(base_model$coefficients) / (1+exp(base_model$coefficients))
+mean(train$class)
+
+# model with all variables
+max_model<-glm(class ~ .,data=df, family=binomial("logit"))
+summary(max_model)
+# save(max_model, file="load/glm_max_model.Rdata")
+```
+
+```{r stepwise_selection, include=F, eval=F}
+
+############## STEPWISE
+model_stepwise_both <- step(
+  base_model, 
+  scope = list(upper=max_model, lower=base_model ), 
+  direction = "both", 
+  trace=T,
+  steps=30,
+  k=4)
+summary(model_stepwise_both)
+
+############ FORWARD
+model_stepwise_for<-step(base_model, scope = list(upper=max_model, lower=~1 ), direction = "forward", trace=T,steps=30,k=2)
+summary(model_stepwise_for)
+
+########### BACKWARD
+model_stepwise_b<-step(max_model,  direction = "backward", trace=T,steps=30,k=2)
+summary(model_stepwise_b)
+
+########## SUBSETING - less automated approach
+# comparioson of models with defined number of variables
+# nbest = number of best models
+# nvmax= max muber of variables in the model
+library(leaps)
+model_nbest<-regsubsets(data[,2:10], data=data, y=data$class, nbest=1, nvmax=15)
+
+plot(model_nbest, scale="adjr2")
+plot(model_nbest, scale="bic")
+
+
+
+# Summary: I will use the model chosen in the stepwise approach
+model <- model_stepwise_both
+save(model, file = "load/glm_model.Rdata")
+
+```
+
+```{r model_quality, include=F, eval=F}
+
+# GOF - completely basic
+# assumption we compare the obtained model with the "ideal" models and check whether the obtained MLV is statistically close to 0
+# H0: the model is well fitted to the data
+gf<-pchisq(model$deviance, model$df.residual,lower.tail = F)
+
+# LR test on the significance of variables
+# we check if the maxW for the model is significantly larger than for the model only with the constant - test for the total significance of the model
+# H0 variables are statistically irrelevant
+ist<-pchisq(model$null.deviance-model$deviance, model$df.null-model$df.residual,lower.tail = F)
+
+# Hosmera - Lemeshowa test  - basic GOF test a model with for binary dependent variable
+# H0: the model is well fitted to the data
+# has many disadvantages - first of all it is very sensitive to the number of buckets
+hr<-hosmerlem(y=df$class, yhat=fitted(model),g=10)
+hosmerlem(y=df$class, yhat=fitted(model),g=7)
+hosmerlem(y=df$class, yhat=fitted(model),g=8)
+hosmerlem(y=df$class, yhat=fitted(model),g=9)
+
+df$base_model<-base_model$fitted.values
+df$model<-model$fitted.values
+df$max_model<-max_model$fitted.values
+
+df$score<-(660-40/log(1/2)*log(1/72))+40/log(1/2)*model$linear.predictors
+
+test$model<-predict(model, newdata=test, type="response") 
+test$score<-(660-40/log(1/2)*log(1/72))+40/log(1/2)*predict(model, newdata=test, type="link") 
+
+train$model<-predict(model, newdata=train, type="response") 
+train$score<-(660-40/log(1/2)*log(1/72))+40/log(1/2)*predict(model, newdata=train, type="link") 
+
+roc_test_base<-roc.test(df$class, df$model, df$base_model,method="d")$p.value
+roc_test_og<-roc.test(df$class, df$max_model, df$model,method="d")$p.value
+
+hist(data[df$class==0,c("score")])
+hist(data[df$class==1,c("score")])
+
+gini_t<-2*auc(df$class,df$model,direction="<")-1
+gini_w<-2*auc(test$class,test$model,direction="<")-1
+
+ci_delong_t<-2*ci.auc(df$class, df$model,method="d",direction="<")-1
+# 0.5205047 0.5366548 0.5528049
+ci_delong_w<-2*ci.auc(test$class, test$model,method="d",direction="<")-1
+
+ks_score_t<-ks.test(df[df$class==0,c("score")],df[df$class==1,c("score")])$statistic
+ks_score_w<-ks.test(test[test$class==0,c("score")],test[test$class==1,c("score")])$statistic
+
+
+################################################### stability
+
+psi<-cal_psi(data1=df, data2=test, bench="score",target="score",bin=20)
+
+ks<-ks.test(df$score,test$score)$p.value
+
+t<-as.data.frame(sort(table(df$score)/length(df$score),decreasing=T))[1:3,1:2]
+w<-as.data.frame(sort(table(test$score)/length(test$score),decreasing=T))[1:3,1:2]
+
+variables<-names(model$coefficients)[2:length(model$coefficients)]
+
+variables_tab <- data.frame()
+models_qual <- data.frame()
+var_qual <- data.frame()
+
+for (i in 1:length(variables)) {
+  tab<-NULL 
+  tab$model<-"model_stepwise_both"
+  tab$v<-variables[i]
+  tab$gini_t <- 2*ci.auc(
+    df[!is.na(df[,variables[i]]),c("class")],
+    df[!is.na(df[,variables[i]]),variables[i]],
+    direction=">",
+    method="d")[2]-1
+  tab$gini_w <- 2*ci.auc(
+    test[!is.na(test[,variables[i]]),c("class")],
+    test[!is.na(test[,variables[i]]),variables[i]],
+    direction=">",
+    method="d")[2]-1
+  
+  tab$psi <- cal_psi_zm(
+    data1=df[!is.na(df[,variables[i]]),variables], 
+    data2=test[!is.na(test[,variables[i]]),variables],
+    bench=variables[i],target=variables[i])
+  
+  tab<-as.data.frame(tab)
+  variables_tab<-rbind(variables_tab, tab)
+}
+
+
+
+
+temp_tab<-as.data.frame(cbind("Model"="model_stepwise_both",
+                              
+                              'ist_param'=ist,
+                              "roc_test_baza"=roc_test_baza,
+                              "hosmer"=hr$p.value,
+                              "gf"=gf,
+                              "ist_ogr"=ist,
+                              "roc_test_og"=roc_test_og,
+                              "gini_t_cil"=ci_delong_t[1],
+                              "gini_t"=gini_t,
+                              "gini_t_ciu"=ci_delong_t[3],
+                              "gini_w_cil"=ci_delong_w[1],
+                              "gini_w"=gini_w,
+                              "gini_w_ciu"=ci_delong_w[3],
+                              "ks_score_t"=ks_score_t,
+                              "ks_score_w"=ks_score_w,
+                              "psi"=psi,
+                              "ks_test"=ks,
+                              
+                              "t_1_n"=t[1,1],
+                              "t_1"=t[1,2],
+                              "t_2_n"=t[2,1],
+                              "t_2"=t[2,2],
+                              "t_3_n"=t[3,1],
+                              "t_3"=t[3,2],
+                              "w_1_n"=w[1,1],
+                              "w_1"=w[1,2],
+                              "w_2_n"=w[2,1],
+                              "w_2"=w[2,2],
+                              "w_3_n"=w[3,1],
+                              "w_3"=w[3,2]
+))
+
+
+models_qual<-rbind(models_qual,temp_tab)
+var_qual<-rbind(var_qual,variables_tab)
+
+save(models_qual,file="models_quality.rdata")
+save(var_qual,file="variables_quality.rdata")
+
+models_qual
+var_qual
+
+```
+
+## Model specification
+
+Firstly, two models were estimated: a model with constant only (1) and a model with all the variables (2). These models can be benchmarks and used to assess if our chosen model form is correct. To choose the proper functional form, a stepwise selection algorithm was used. Stepwise regression is based on that in each step, a variable is considered for addition or substraction from the set of all variables, based on defined information criterion. We used *stats* package, which uses AIC criterion while number of degrees of freedom used for the penalty is set k = 2. We decided to use more conservative k = 4. 
+
+```{r print_chosen_model, results='asis'}
+
+load("load/glm_model.Rdata")
+
+stargazer(base_model, max_model, model, 
+          type = "html",
+          single.row = F,
+          report = "vc*",
+          notes = "<em>&#42;p&lt;0.1;&#42;&#42;p&lt;0.05;&#42;&#42;&#42;p&lt;0.01</em>", 
+          notes.append = F)
+
+
+```
+
+Because we used WoE transformation, we would expect all coefficients to be negative as the higher the WoE, the less probability of default. This could be a problem from the business side, however in this research we focus mainly on forecasts, so we will leave it as it is.
+
+We can also see that Akaike Information Criterion is smaller for the chosen model than for the base and max models. This suggests that our model is a better fit to the data.
+
+## Quality assessment
+
+To assess if the model is specified correctly, we performed tests assessing model quality.
+
+```{r}
+# GOF - completely basic
+# assumption we compare the obtained model with the "ideal" models and check whether the obtained MLV is statistically close to 0
+# H0: the model is well fitted to the data
+gf<-pchisq(model$deviance, model$df.residual,lower.tail = F)
+```
+
+### Goodness of fit
+
+Firstly, we conducted a Pearson Chi2 and Deviance test. Its null hypothesis says that the model is well fitted to the data. We obtained p-value equal to `r round(gf,4)`, so there is no evidence to reject the null hypothesis.
+
+```{r}
+# LR test on the significance of variables
+# we check if the maxW for the model is significantly larger than for the model only with the constant - test for the total significance of the model
+# H0 variables are statistically irrelevant
+ist<-pchisq(model$null.deviance-model$deviance, model$df.null-model$df.residual,lower.tail = F)
+```
+
+Then we performed LR test on the joint significance of variables. In this case null hypothesis states that variables are statistically irrelevant. P-value of this test is `r round(ist, 4)`, so we reject the null hypothesis.
+
+```{r}
+# Hosmera - Lemeshowa test  - basic GOF test a model with for binary dependent variable
+# H0: the model is well fitted to the data
+# has many disadvantages - first of all it is very sensitive to the number of buckets
+hr_10 <- hosmerlem(y=df$class, yhat=fitted(model),g=10)$p.value
+hr_7 <- hosmerlem(y=df$class, yhat=fitted(model),g=7)$p.value
+hr_8 <- hosmerlem(y=df$class, yhat=fitted(model),g=8)$p.value
+hr_9 <- hosmerlem(y=df$class, yhat=fitted(model),g=9)$p.value
+```
+
+Afterwards, we did a Hosmer-Lemeshow test. This test's null hypothesis tells that model is well fitted to the data. As the model is very sensitive to the number of buckets used, we repeated this test for 7, 8, 9 and 10 buckets. The p-values we obtained are respectively `r round(hr_7,4)`, `r round(hr_8,4)`, `r round(hr_9,4)` and `r round(hr_10,4)`. In each case we cannot reject the null hypothesis, which suggests that our formula is correct.
+
+### Discriminatory/predictive power
+
+Next, we tried to assess the discriminatory power of the model. Therefore, we estimated confidence intervals of the Gini index. The rule of the thumb says that for a behavioral model, Gini index should be at least 60%. We can see that in our case, while the training sample achieves this result, the testing sample does not. It might suggest that we have a slight problem with overfitting.
+
+```{r message=F}
+train$model<-predict(model, newdata=train, type="response") 
+test$model<-predict(model, newdata=test, type="response") 
+df$base_model<-base_model$fitted.values
+df$model<-model$fitted.values
+df$max_model<-max_model$fitted.values
+
+ci_delong_t<-2*ci.auc(df$class, df$model,method="d",direction="<")-1
+ci_delong_w<-2*ci.auc(test$class, test$model,method="d",direction="<")-1
+
+conf_int_matrix <- rbind(ci_delong_t, ci_delong_w)
+colnames(conf_int_matrix) <- c("Lower limit", "Mean", "Upper limit")
+rownames(conf_int_matrix) <- c("Train sample", "Test sample")
+
+kable(conf_int_matrix, digits = 4) %>% 
+  kable_styling(bootstrap_options = c("striped", "hover","condensed", "responsive"))
+
+```
+
+```{r message=FALSE, warning=FALSE}
+df$score<-(660-40/log(1/2)*log(1/72))+40/log(1/2)*model$linear.predictors
+test$score<-(660-40/log(1/2)*log(1/72))+40/log(1/2)*predict(model, newdata=test, type="link") 
+
+ks_score_t<-ks.test(df[df$class==0,c("score")],df[df$class==1,c("score")])$statistic
+ks_score_w<-ks.test(test[test$class==0,c("score")],test[test$class==1,c("score")])$statistic
+
+```
+
+We also estimated the K-S statistics. For the test sample it equals `r round(ks_score_t,4)`, while for the train sample `r round(ks_score_w, 4)`. Again we can see that statistics is better for the training sample than for the test sample. The rule of the thumb says that for behavioral model, we should obtain at least 0.5 - we can see we are not that far from this value.
+
+```{r message=FALSE, warning=FALSE}
+psi<-cal_psi(data1=df, data2=test, bench="score",target="score",bin=20)
+
+ks<-ks.test(df$score,test$score)$p.value
+
+```
+
+### Stability 
+
+Later we evaluated stability tests, namely PSI and Kolmogorov-Smirnov test. To do that, firstly we calculated score of each customer in the test and train sample. Then, we estimated Population Stability Index (PSI) to compare the distribution of the scoring variable in both sets. The thumb rule states that if PSI is less than 0.1 then no change in scoring model is needed. Our PSI equals to `r round(psi, 4)`, so the model is stable.
+
+The null hypothesis of the Kolmogorov-Smirnov test states that there is no difference between the two distributions. P-value of the test equals to 'r round(ks, 4)` so we have no reason to reject the null hypothesis. 
+
+```{r message=F, warning=FALSE}
+roc_test_base<-roc.test(df$class, df$model, df$base_model, method="d")$p.value
+roc_test_og<-roc.test(df$class, df$max_model, df$model, method="d")$p.value
+```
+
+### Comparison to base and max models
+
+Finally, we compared the difference in areas under the ROC curves with ROC test. The null hypothesis in the test is that the difference is equal to 0, against the alternative hypothesis that it is not equal to 0. When we compare our model to the *base model*, including only intercept, p-value of ROC test is `r round(roc_test_base, 4)`, so the area under curves are different. P-value of ROC test for our model and the *max model*, including all the variables, is `r round(roc_test_og,4)`, so we have no reason to reject the null hypothesis.
+
+### Summary
+
+Taking into consideration all the tests, we decided to use the model obtained by stepwise regression as the final one.
+
+# Random Forests
+
+
+```{r random_forest_split_train_test, eval=F, include=F}
+
+load("load/df.rda")
+load("load/test.RData")
+load("load/train.RData")
+
+intersection_test <- intersect(df[,c('age', 'credit_amount', 'duration')], test[, c("age", "credit_amount", "duration")])
+intersection_train <- intersect(df[,c('age', 'credit_amount', 'duration')], train[, c("age", "credit_amount", "duration")])
+
+train_raw <- data.frame()
+test_raw <- data.frame()
+
+for (i in (1:nrow(intersection_test))){
+  age=intersection_test$age[i]
+  credit_amount=intersection_test$credit_amount[i]
+  duration=intersection_test$duration[i]
+  matched_row <- df[df$age %in% age & df$credit_amount %in% credit_amount & df$duration %in% duration,]
+  test_raw <- rbind(test_raw,matched_row)
+}
+
+for (i in (1:nrow(intersection_train))){
+  age=intersection_train$age[i]
+  credit_amount=intersection_train$credit_amount[i]
+  duration=intersection_train$duration[i]
+  matched_row <- df[df$age %in% age & df$credit_amount %in% credit_amount & df$duration %in% duration,]
+  train_raw <- rbind(train_raw,matched_row)
+}
+
+sum(train_raw$credit_amount)
+
+save(train_raw,file="load/train_raw.RData")
+save(test_raw,file="load/test_raw.RData")
+```
+
+```{r accuracy_ROC, eval=F, include=F}
+library(pROC)
+accuracy_ROC <- function(model, 
+                         data, 
+                         target_variable = "class",
+                         predicted_class = "bad") {
+  
+  # generate probabilities of level "predicted_class"
+    forecasts_p <- predict(model, data,
+                         type = "prob")[, predicted_class]
+  
+  # and the predicted  cateogry
+  if (any(class(model) == "train")) forecasts_c <- predict(model, data) else
+     forecasts_c <- predict(model, data, type = "class")
+  
+  # actual values - pull() transforms tibble into vector
+  real <- (data[, target_variable])
+  
+  # area under the curve
+  AUC <- roc(predictor = forecasts_p,
+             response = real)
+  
+  # classification table and measures based on it 
+  table <- confusionMatrix(forecasts_c,
+                           real,
+                           predicted_class) 
+  # collect everything in a single object 
+  result <- c(table$overall[1], # Accuracy
+              table$byClass[1:2], # sens, spec
+              ROC = AUC$auc)
+  
+  return(result)
+  
+}
+```
+
+```{r random_forest_raw_data, eval=F, include=F}
+load("load/test_raw.RData")
+load("load/train_raw.RData")
+
+set.seed(1916)
+library(randomForest)
+library(caret)
+
+model.formula <- class ~ .
+
+# First Random Forest with default parameters
+## mtry = sqrt(n) = 4
+## ntree = 500
+set.seed(1916)
+rf1 <- randomForest(model.formula,
+                    data = train_raw)
+print(rf1)
+plot(rf1)
+
+# As the number of trees is higher, the OOB error (black line) is smaller,
+# and converges to approx. 400 trees.
+
+# Hence, let us try to limit number of trees and estimate the model
+# on bootstrap samples from the full data set.
+# We also increase the number of predictors used from 4 to 8.
+set.seed(1916)
+rf2 <- randomForest(model.formula,
+                    data = train_raw,
+                    ntree = 400,
+                    mtry = 8,
+                    # we also generate 
+                    # predictors importance measures,
+                    importance = TRUE)
+print(rf2)
+
+# the OOB error is higher now!
+# let us see it again on the plot with respect to number of trees
+plot(rf2)
+
+# let us try to optimize the mtry parameter using cross-validation process
+# we consider 21 predictors in the model formula hence let us try mtry between 2 and 17
+parameters_rf <- expand.grid(mtry = 2:17)
+
+ctrl_cv <- trainControl(method = "cv", 
+                         number = 10,
+                         classProbs = TRUE)
+set.seed(1916)
+rf3 <- train(model.formula,
+             data = train_raw, 
+             method = "rf", 
+             ntree = 400,
+             tuneGrid = parameters_rf, 
+             trControl = ctrl_cv,
+             importance = TRUE)
+
+print(rf3)
+plot(rf3)
+
+# optimal mtry = 12
+
+set.seed(1916)
+rf4 <-  randomForest(model.formula,
+                    data = train_raw,
+                    ntree = 400,
+                    mtry = 12,
+                    importance = TRUE)
+print(rf4)
+
+save(rf4,file="load/rf4.Rdata")
+
+accuracy_ROC(model = rf1,
+             data = train_raw)
+
+accuracy_ROC(model = rf2,
+             data = train_raw)
+
+accuracy_ROC(model = rf3,
+             data = train_raw)
+
+accuracy_ROC(model = rf4,
+             data = train_raw)
+
+
+# let us compare prediction errors on the testing set 
+# from particular models
+accuracy_ROC(model = rf1,
+             data = test_raw)
+
+accuracy_ROC(model = rf2,
+             data = test_raw)
+
+accuracy_ROC(model = rf3,
+             data = test_raw)
+
+accuracy_ROC(model = rf4,
+             data = test_raw)
+
+# we might have a problem with overfitting, but let it slide
+
+```
+
+
+Random Forests is a supervised learning method for classification. It is based on generating a large number of decision trees, each constructed using a different subset of the training set. Random forests correct for decision tree's habit of overfitting to the training set.
+
+In case of random forests, we decided to use raw, unprocessed data. Firstly, we set abitrarily the number of trees as ntree=500 and number of predictors as m=4 (number which is the closest to the square root of 20). Then we decided to decrease number of trees to 400, as the OOB error seems to be stable after this point. Afterwards, we used cross-validation process to choose optimal number of m. Finally we decided to use random forest with m=12.
+
+```{r random_forest_print, message=F, error=F}
+library(randomForest)
+load("load/rf4.Rdata")
+print(rf4)
+```
+
+Random Forest also generates features' importance plots - mean decrease Accuracy and mean decrease Gini. We can see that the insights from these plots are similar to those based on previous results from Logistic Regression - the most important variables include *checking_status*, *duration* and *credit_amount*. 
+
+```{r random_forest_feature_imp, fig.align='center', fig.asp = .75}
+varImpPlot(rf4, main="Features' importance")
+```
+
+# Results
+
+```{r calc_results, message=F}
+
+load("load/glm_model.Rdata")
+load("load/rf4.Rdata")
+load("load/test_final.Rdata")
+load("load/test_raw.RData")
+
+# real
+real_rf <- test_raw$class
+real_glm <- factor(test$class, levels=c(0,1), labels=c("good", "bad"))
+
+# glm
+pred_prob_glm <- predict(model, newdata=test, type="response") #  P(Y = 1|X)
+pred_class_glm <- factor(ifelse(pred_prob_glm>.5, 1, 0), levels=c(0,1), labels=c("good", "bad"))
+
+
+# random forest
+pred_prob_rf <- predict(rf4, newdata=test_raw, type="prob")[, "bad"]
+pred_class_rf <- predict(rf4, newdata=test_raw, type="class")
+
+AUC_glm <- roc(predictor = pred_prob_glm, response = real_glm, plot=F)
+AUC_rf <- roc(predictor = pred_prob_rf, response = real_rf, plot=F)
+
+table_glm <- confusionMatrix(pred_class_glm,
+                           real_glm,
+                           "bad")
+
+table_rf <- confusionMatrix(pred_class_rf,
+                           real_rf,
+                           "bad")
+
+```
+
+To compare results, firstly we calculated the AuC for both GLM and RF, assuming cut-off point for GLM at 50%. The difference is not big.
+AuC for GLM is `r round(AUC_glm$auc,4)`, while for the RF it is `r round(AUC_rf$auc,4)`.
+
+Next, we plotted the confusion matrix for both models.
+
+```{r plot_confusion_matrix, message=F, fig.align='center', fig.asp = .7, warning=F}
+source("plot_confusion_matrix.R")
+draw_confusion_matrix(table_glm,mytitle="Confustion matrix for Logistic Regression")
+draw_confusion_matrix(table_rf,mytitle="Confustion matrix for Random Forest")
+```
+
+Both the Accuracy and the Sensivity are better for Random Forest, thus it seems that Random Forest outperforms Logistic Regression.
 
 # Summary
+
+In this research I compared predictive power of Logistic Regression and Random Forest in the context of Credit Scorecard. Firstly I estimated GLM model, in accordance with best practices and subsequently I trained a Random Forest, using cross-validation to optimise hyperparameters. Random Forest seems to outperform Logistic Regression, however the difference is not immense. In case of Credit Scorecard building, GLM models still are preferable as they provide clear answer about how each trait of a client contributes to their Credit Score.
